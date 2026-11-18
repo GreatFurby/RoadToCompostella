@@ -33,6 +33,7 @@ input{width:100%;padding:10px;border:1px solid #aebbb0;border-radius:6px}
 .meeple-name{background:#fff;color:#26352c;border-radius:9px;padding:1px 6px;box-shadow:0 1px 3px #0004;font-size:11px;font-weight:700;max-width:110px;overflow:hidden;text-overflow:ellipsis}
 .meeple-body{display:grid;place-items:center;width:29px;height:29px;border-radius:50%;background:var(--player);border:2px solid #fff;box-shadow:0 1px 4px #0005;font-size:17px}
 .meeple.you .meeple-name{background:#214c38;color:white}
+.walker-group{display:grid;place-items:center;border-radius:14px;background:#214c38;color:#fff;font-weight:700;box-shadow:0 1px 4px #0005;white-space:nowrap}
 .next-icon{border:2px solid #664f16;background:#ffda61;border-radius:50%;box-shadow:0 0 0 3px #ffecacaa}
 .next-icon.locked{background:#e6e3d9;box-shadow:none;border-color:#79796a;cursor:default}
 @media(max-width:500px){header{gap:6px}nav{gap:4px}nav button{padding-inline:8px}main{padding:8px}#map{height:clamp(270px,calc(100dvh - 240px),680px)}}
@@ -59,8 +60,7 @@ input{width:100%;padding:10px;border:1px solid #aebbb0;border-radius:6px}
     <button id="manual" type="button" hidden>Enter steps</button>
     <button id="move" type="button">Move one node</button>
     <a class="button" id="street" target="_blank" rel="noopener">Street View</a>
-    <button id="overview" type="button">Full route</button>
-    <button id="center" type="button">Back to me</button>
+    <button id="center" type="button" hidden>Back to me</button>
   </div>
   <section id="entry" hidden>
     <h2>Enter steps</h2>
@@ -85,7 +85,10 @@ let token = '';
 try { token = sessionStorage.getItem(sessionKey) || ''; } catch {}
 let state = null;
 let busy = false;
-let map, route, meters, nodes, overview, walked, ahead, playerMarkers, nextMarker;
+let needsSync = false;
+const localZoom = 16;
+const namedZoom = localZoom;
+let map, route, meters, nodes, walked, ahead, playerMarkers, nextMarker;
 const colours = ['#226a48','#5745a0','#a24355','#286b99','#985a26','#677823'];
 
 function readRoute() {
@@ -161,6 +164,7 @@ function showPage(page) {
 function signedOut() {
   setToken('');
   state = null;
+  needsSync = false;
   $('login').hidden = false;
   $('signed-in').hidden = true;
   $('entry').hidden = true;
@@ -169,7 +173,7 @@ function signedOut() {
 }
 function controls() {
   for (const button of document.querySelectorAll('form button, #sync, #logout')) button.disabled = busy;
-  $('move').disabled = busy || !state?.pointsAvailable || state.nextNodeId === null;
+  $('move').disabled = busy || needsSync || !state?.pointsAvailable || state.nextNodeId === null;
   if (nextMarker) nextMarker.setIcon(nextIcon());
 }
 async function run(work, pending, complete = '') {
@@ -190,8 +194,9 @@ async function run(work, pending, complete = '') {
 }
 function startMap() {
   if (!route) readRoute();
-  map = L.map('map', {preferCanvas:true,maxZoom:19}).setView(nodes[state.currentNodeId],16);
-  overview = L.latLngBounds(route);
+  map = L.map('map', {preferCanvas:true,maxZoom:19}).setView(nodes[state.currentNodeId],localZoom);
+  map.on('zoomend', drawPlayers);
+  map.on('moveend', updateCenterControl);
   map.attributionControl.addAttribution('<a href="https://www.openstreetmap.org/copyright">OSM contributors</a> · <a href="https://guiarutas.es/caminos/frances/">FEAACS / IGN</a>');
   map.createPane('basemap').style.zIndex = 200;
   try {
@@ -220,28 +225,51 @@ function drawPlayers() {
     if (!groups.has(node)) groups.set(node,[]);
     groups.get(node).push(player);
   });
-  for (const [node,group] of groups) group.forEach((player,index) => {
-    const icon = document.createElement('div');
-    const name = document.createElement('span');
-    const body = document.createElement('span');
-    icon.className = player.you ? 'meeple you' : 'meeple';
-    icon.style.setProperty('--offset', (index - (group.length - 1) / 2) * 62 + 'px');
-    icon.style.setProperty('--player',player.you ? colours[0] : colourFor(player.id));
-    name.className = 'meeple-name';
-    name.textContent = player.displayName;
-    body.className = 'meeple-body';
-    body.textContent = '🚶';
-    icon.append(name,body);
-    L.marker(nodes[node],{interactive:false,keyboard:false,icon:L.divIcon({
-      className:'player-icon',html:icon,iconSize:[1,1],iconAnchor:[0,0]
-    })}).addTo(playerMarkers);
-  });
+  for (const [node,group] of groups) {
+    if (group.length > 1 && map.getZoom() < namedZoom) {
+      const label = document.createElement('span');
+      label.textContent = group.length + ' walkers';
+      const names = document.createElement('div');
+      group.forEach(player => {
+        const name = document.createElement('div');
+        name.textContent = player.displayName;
+        names.append(name);
+      });
+      L.marker(nodes[node], {title:label.textContent, icon:L.divIcon({
+        className:'walker-group',html:label,iconSize:[80,28],iconAnchor:[40,28]
+      })}).bindPopup(names).addTo(playerMarkers);
+      continue;
+    }
+    group.forEach((player,index) => {
+      const icon = document.createElement('div');
+      const name = document.createElement('span');
+      const body = document.createElement('span');
+      icon.className = player.you ? 'meeple you' : 'meeple';
+      icon.style.setProperty('--offset', (index - (group.length - 1) / 2) * 62 + 'px');
+      icon.style.setProperty('--player',player.you ? colours[0] : colourFor(player.id));
+      name.className = 'meeple-name';
+      name.textContent = player.displayName;
+      body.className = 'meeple-body';
+      body.textContent = '🚶';
+      icon.append(name,body);
+      L.marker(nodes[node],{interactive:false,keyboard:false,icon:L.divIcon({
+        className:'player-icon',html:icon,iconSize:[1,1],iconAnchor:[0,0]
+      })}).addTo(playerMarkers);
+    });
+  }
+}
+function updateCenterControl() {
+  const target = nodes[state.currentNodeId];
+  const center = map.getCenter();
+  const zoom = map.getZoom();
+  const close = map.latLngToContainerPoint(target).distanceTo(map.latLngToContainerPoint(center)) < 8;
+  $('center').hidden = close && zoom === localZoom;
 }
 function nextIcon() {
-  const enabled = !busy && state.pointsAvailable > 0;
+  const enabled = !busy && !needsSync && state.pointsAvailable > 0;
   return L.divIcon({className:'next-icon' + (enabled ? '' : ' locked'),iconSize:[26,26],iconAnchor:[13,13]});
 }
-function applyState(next, showMap = true) {
+function applyState(next, animateMove = false) {
   if (!nodes) readRoute();
   if (!nodes[next.currentNodeId] || next.lastNodeId !== nodes.length - 1) {
     throw new Error('The map and backend use different route versions.');
@@ -258,7 +286,7 @@ function applyState(next, showMap = true) {
   if (!$('steps').elements.date.value) $('steps').elements.date.value = state.today;
   const current = nodes[state.currentNodeId];
   $('street').href = 'https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=' + current.join(',');
-  if (showMap) showPage('map');
+  showPage('map');
   if (!map) startMap();
   if (positionChanged) {
     const distance = state.nextNodeId === null ? meters[meters.length - 1] : state.currentNodeId * 100;
@@ -270,8 +298,10 @@ function applyState(next, showMap = true) {
     }
     walked.setLatLngs([...route.slice(0,low),current]);
     ahead.setLatLngs([current,...route.slice(low)]);
-    map.setView(current,Math.max(16,map.getZoom()),{animate:false});
+    if (animateMove) map.panTo(current,{animate:true,duration:0.2});
+    else map.setView(current,map.getZoom(),{animate:false});
   }
+  updateCenterControl();
   drawPlayers();
   if (nextMarker) { nextMarker.remove(); nextMarker = null; }
   if (nodes[state.nextNodeId]) nextMarker = L.marker(nodes[state.nextNodeId], {
@@ -279,12 +309,37 @@ function applyState(next, showMap = true) {
   }).on('click',move).addTo(map);
 }
 function move() {
-  if (!state || !state.pointsAvailable || state.nextNodeId === null) return;
+  if (busy || needsSync || !state?.pointsAvailable || state.nextNodeId === null) return;
+  const previous = state;
+  const destination = previous.nextNodeId;
   run(async () => {
-    try { applyState(await api('move',{fromNodeId:state.currentNodeId})); }
-    catch (error) {
-      if (error.code === 'POSITION_CHANGED' || error.code === 'NO_POINTS') applyState(await api('state'));
-      throw error;
+    const started = performance.now();
+    const save = api('move',{fromNodeId:previous.currentNodeId});
+    try {
+      applyState({
+        ...previous,
+        currentNodeId:destination,
+        nextNodeId:destination < previous.lastNodeId ? destination + 1 : null,
+        pointsAvailable:previous.pointsAvailable - 1
+      }, true);
+    } finally {
+      try {
+        applyState(await save);
+      } catch (error) {
+        if (error.code === 'UNAUTHORIZED') throw error;
+        try {
+          applyState(await api('state'));
+          if (state.currentNodeId !== previous.currentNodeId) return;
+        } catch (refreshError) {
+          if (refreshError.code === 'UNAUTHORIZED') throw refreshError;
+          needsSync = true;
+          applyState(previous);
+          throw new Error('Could not confirm the move. Tap Sync before moving again.');
+        }
+        throw error;
+      } finally {
+        console.debug('Move confirmation flow took ' + Math.round(performance.now() - started) + ' ms');
+      }
     }
   },'Saving your move…');
 }
@@ -299,7 +354,7 @@ $('login').onsubmit = event => {
   },'Signing in…');
 };
 $('logout').onclick = () => run(async () => { await api('logout'); signedOut(); },'Signing out…');
-$('sync').onclick = () => run(async () => applyState(await api('state')),'Syncing…','Game synced.');
+$('sync').onclick = () => run(async () => { applyState(await api('state')); needsSync = false; },'Syncing…','Game synced.');
 $('move').onclick = move;
 $('manual').onclick = () => { $('entry').hidden = !$('entry').hidden; };
 $('steps').onsubmit = event => {
@@ -313,8 +368,7 @@ $('steps').onsubmit = event => {
 };
 $('map-tab').onclick = () => showPage('map');
 $('account-tab').onclick = () => showPage('account');
-$('overview').onclick = () => map.fitBounds(overview,{padding:[18,18]});
-$('center').onclick = () => map.setView(nodes[state.currentNodeId],16);
+$('center').onclick = () => map.setView(nodes[state.currentNodeId],localZoom);
 if (!backendConfigured) {
   $('login').hidden = true;
   $('notice').textContent = 'The game owner needs to connect the backend.';
