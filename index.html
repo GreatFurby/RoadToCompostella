@@ -82,7 +82,49 @@ input{width:100%;padding:10px;border:1px solid #aebbb0;border-radius:6px}
 const $ = id => document.getElementById(id);
 const sessionKey = 'rtc-browser-session';
 let token = '';
-try { token = sessionStorage.getItem(sessionKey) || ''; } catch {}
+try { token = localStorage.getItem(sessionKey) || ''; } catch {}
+if (!token) {
+  try { token = sessionStorage.getItem(sessionKey) || ''; } catch {}
+  if (token) setToken(token);
+}
+const androidApp = navigator.userAgent.includes(' RoadToCompostellaAndroid/');
+let healthPort;
+let stepRequest;
+window.addEventListener('message', event => {
+  if (!androidApp || event.data !== 'rtc-health-connect' || !event.ports?.[0]) return;
+  healthPort = event.ports[0];
+  healthPort.onmessage = event => {
+    if (!stepRequest) return;
+    const {resolve, reject, timer} = stepRequest;
+    stepRequest = undefined;
+    clearTimeout(timer);
+    try {
+      const result = JSON.parse(event.data);
+      if (result.error) reject(new Error(result.error));
+      else resolve(result);
+    } catch {
+      reject(new Error('Could not read steps from Android.'));
+    }
+  };
+  $('street').removeAttribute('target');
+});
+function readAndroidSteps() {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      stepRequest = undefined;
+      healthPort.close();
+      healthPort = undefined;
+      reject(new Error('Step reading timed out. Reopen the app and try again.'));
+    }, 90000);
+    stepRequest = {resolve, reject, timer};
+    try { healthPort.postMessage('readToday'); }
+    catch (error) {
+      clearTimeout(timer);
+      stepRequest = undefined;
+      reject(new Error('Reopen the Android app and try Sync again.'));
+    }
+  });
+}
 let state = null;
 let busy = false;
 let needsSync = false;
@@ -149,6 +191,10 @@ async function api(action, fields = {}) {
 function setToken(value) {
   token = value;
   try {
+    if (value) localStorage.setItem(sessionKey, value);
+    else localStorage.removeItem(sessionKey);
+  } catch {}
+  try {
     if (value) sessionStorage.setItem(sessionKey, value);
     else sessionStorage.removeItem(sessionKey);
   } catch {}
@@ -184,7 +230,7 @@ async function run(work, pending, complete = '') {
   controls();
   try {
     await work();
-    $('notice').textContent = complete;
+    if (complete || $('notice').textContent === pending) $('notice').textContent = complete;
   } catch (error) {
     if (error.code === 'UNAUTHORIZED') signedOut();
     $('notice').textContent = error?.message || 'Something went wrong. Try again.';
@@ -388,7 +434,18 @@ $('login').onsubmit = event => {
   },'Signing in…');
 };
 $('logout').onclick = () => run(async () => { await api('logout'); signedOut(); },'Signing out…');
-$('sync').onclick = () => run(async () => { applyState(await api('state')); needsSync = false; },'Syncing…','Game synced.');
+$('sync').onclick = () => run(async () => {
+  if (androidApp && !healthPort) throw new Error('Android step sync is unavailable. Reopen the app and try again.');
+  const reading = androidApp ? await readAndroidSteps() : {};
+  const updated = reading.steps == null
+    ? await api('state')
+    : await api('syncSteps', {date:reading.date, steps:reading.steps});
+  applyState(updated);
+  needsSync = false;
+  $('notice').textContent = reading.steps != null
+    ? reading.steps.toLocaleString() + ' steps synced today.'
+    : healthPort ? 'Game refreshed. Health Connect has no steps for today yet.' : 'Game synced.';
+},'Syncing…');
 $('move').onclick = move;
 $('manual').onclick = () => { $('entry').hidden = !$('entry').hidden; };
 $('steps').onsubmit = event => {
