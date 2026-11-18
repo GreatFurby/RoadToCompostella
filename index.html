@@ -29,7 +29,7 @@ form{display:grid;gap:10px}
 label{display:grid;gap:4px}
 input{width:100%;padding:10px;border:1px solid #aebbb0;border-radius:6px}
 .player-icon{background:transparent;border:0;pointer-events:none}
-.meeple{display:grid;justify-items:center;position:absolute;bottom:0;left:50%;width:max-content;transform:translateX(calc(-50% + var(--offset)));gap:2px}
+.meeple{display:grid;justify-items:center;position:absolute;bottom:0;left:50%;width:max-content;transform:translate(calc(-50% + var(--offset-x)), var(--offset-y));gap:2px}
 .meeple-name{background:#fff;color:#26352c;border-radius:9px;padding:1px 6px;box-shadow:0 1px 3px #0004;font-size:11px;font-weight:700;max-width:110px;overflow:hidden;text-overflow:ellipsis}
 .meeple-body{display:grid;place-items:center;width:29px;height:29px;border-radius:50%;background:var(--player);border:2px solid #fff;box-shadow:0 1px 4px #0005;font-size:17px}
 .meeple.you .meeple-name{background:#214c38;color:white}
@@ -86,7 +86,8 @@ try { token = sessionStorage.getItem(sessionKey) || ''; } catch {}
 let state = null;
 let busy = false;
 let needsSync = false;
-const localZoom = 16;
+let savingMoves = false;
+const localZoom = 17;
 const namedZoom = localZoom;
 let map, route, meters, nodes, walked, ahead, playerMarkers, nextMarker;
 const colours = ['#226a48','#5745a0','#a24355','#286b99','#985a26','#677823'];
@@ -172,12 +173,12 @@ function signedOut() {
   showPage('account');
 }
 function controls() {
-  for (const button of document.querySelectorAll('form button, #sync, #logout')) button.disabled = busy;
+  for (const button of document.querySelectorAll('form button, #sync, #logout')) button.disabled = busy || savingMoves;
   $('move').disabled = busy || needsSync || !state?.pointsAvailable || state.nextNodeId === null;
   if (nextMarker) nextMarker.setIcon(nextIcon());
 }
 async function run(work, pending, complete = '') {
-  if (busy) return;
+  if (busy || savingMoves) return;
   busy = true;
   $('notice').textContent = pending;
   controls();
@@ -226,7 +227,7 @@ function drawPlayers() {
     groups.get(node).push(player);
   });
   for (const [node,group] of groups) {
-    if (group.length > 1 && map.getZoom() < namedZoom) {
+    if (group.length > 1 && (map.getZoom() < namedZoom || group.length > 5)) {
       const label = document.createElement('span');
       label.textContent = group.length + ' walkers';
       const names = document.createElement('div');
@@ -245,7 +246,10 @@ function drawPlayers() {
       const name = document.createElement('span');
       const body = document.createElement('span');
       icon.className = player.you ? 'meeple you' : 'meeple';
-      icon.style.setProperty('--offset', (index - (group.length - 1) / 2) * 62 + 'px');
+      const angle = -Math.PI / 2 + index * 2 * Math.PI / group.length;
+      const radius = group.length > 1 ? 30 : 0;
+      icon.style.setProperty('--offset-x', Math.round(Math.cos(angle) * radius) + 'px');
+      icon.style.setProperty('--offset-y', Math.round(Math.sin(angle) * radius) + 'px');
       icon.style.setProperty('--player',player.you ? colours[0] : colourFor(player.id));
       name.className = 'meeple-name';
       name.textContent = player.displayName;
@@ -269,7 +273,7 @@ function nextIcon() {
   const enabled = !busy && !needsSync && state.pointsAvailable > 0;
   return L.divIcon({className:'next-icon' + (enabled ? '' : ' locked'),iconSize:[26,26],iconAnchor:[13,13]});
 }
-function applyState(next, animateMove = false) {
+function applyState(next, animateMove = false, openMap = true) {
   if (!nodes) readRoute();
   if (!nodes[next.currentNodeId] || next.lastNodeId !== nodes.length - 1) {
     throw new Error('The map and backend use different route versions.');
@@ -286,7 +290,7 @@ function applyState(next, animateMove = false) {
   if (!$('steps').elements.date.value) $('steps').elements.date.value = state.today;
   const current = nodes[state.currentNodeId];
   $('street').href = 'https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=' + current.join(',');
-  showPage('map');
+  if (openMap) showPage('map');
   if (!map) startMap();
   if (positionChanged) {
     const distance = state.nextNodeId === null ? meters[meters.length - 1] : state.currentNodeId * 100;
@@ -308,40 +312,70 @@ function applyState(next, animateMove = false) {
     icon:nextIcon(),title:'Move one node'
   }).on('click',move).addTo(map);
 }
+function previewMoves(base, destination) {
+  const count = destination - base.currentNodeId;
+  return {
+    ...base,
+    currentNodeId:destination,
+    nextNodeId:destination < base.lastNodeId ? destination + 1 : null,
+    pointsSpent:base.pointsSpent + count,
+    pointsAvailable:base.pointsAvailable - count
+  };
+}
 function move() {
   if (busy || needsSync || !state?.pointsAvailable || state.nextNodeId === null) return;
   const previous = state;
-  const destination = previous.nextNodeId;
-  run(async () => {
-    const started = performance.now();
-    const save = api('move',{fromNodeId:previous.currentNodeId});
-    try {
-      applyState({
-        ...previous,
-        currentNodeId:destination,
-        nextNodeId:destination < previous.lastNodeId ? destination + 1 : null,
-        pointsAvailable:previous.pointsAvailable - 1
-      }, true);
-    } finally {
-      try {
-        applyState(await save);
-      } catch (error) {
-        if (error.code === 'UNAUTHORIZED') throw error;
-        try {
-          applyState(await api('state'));
-          if (state.currentNodeId !== previous.currentNodeId) return;
-        } catch (refreshError) {
-          if (refreshError.code === 'UNAUTHORIZED') throw refreshError;
-          needsSync = true;
-          applyState(previous);
-          throw new Error('Could not confirm the move. Tap Sync before moving again.');
-        }
-        throw error;
-      } finally {
-        console.debug('Move confirmation flow took ' + Math.round(performance.now() - started) + ' ms');
+  applyState(previewMoves(previous, previous.nextNodeId), true);
+  if (!savingMoves) saveMoves(previous);
+}
+async function saveMoves(confirmed) {
+  savingMoves = true;
+  $('notice').textContent = 'Saving moves…';
+  controls();
+  try {
+    while (state.currentNodeId > confirmed.currentNodeId) {
+      const destination = state.currentNodeId;
+      const fromNodeId = confirmed.currentNodeId;
+      const count = destination - fromNodeId;
+      const saved = await (count === 1
+        ? api('move',{fromNodeId})
+        : api('moveBatch',{fromNodeId,count}));
+      confirmed = saved;
+      const queuedDestination = state.currentNodeId;
+      const queued = queuedDestination - destination;
+      if (saved.currentNodeId !== destination || saved.pointsAvailable < queued) {
+        applyState(saved,false,false);
+        $('notice').textContent = 'Progress changed. Review your position before moving again.';
+        return;
       }
+      applyState(previewMoves(saved, queuedDestination),false,false);
     }
-  },'Saving your move…');
+    $('notice').textContent = '';
+  } catch (error) {
+    if (error.code === 'UNAUTHORIZED') {
+      signedOut();
+      $('notice').textContent = error.message;
+      return;
+    }
+    needsSync = true;
+    controls();
+    try {
+      applyState(await api('state'),false,false);
+      needsSync = false;
+      $('notice').textContent = 'Position refreshed. Check where you landed before moving again.';
+    } catch (refreshError) {
+      if (refreshError.code === 'UNAUTHORIZED') {
+        signedOut();
+        $('notice').textContent = refreshError.message;
+        return;
+      }
+      applyState(confirmed,false,false);
+      $('notice').textContent = 'Could not confirm all moves. Tap Sync before moving again.';
+    }
+  } finally {
+    savingMoves = false;
+    controls();
+  }
 }
 $('login').onsubmit = event => {
   event.preventDefault();
